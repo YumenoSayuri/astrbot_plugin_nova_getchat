@@ -1,0 +1,83 @@
+{
+  "enable_forward_analysis": {
+    "type": "bool",
+    "default": true,
+    "description": "启用合并转发消息分析",
+    "hint": "开启后自动检测并解析合并转发消息"
+  },
+  "forward_template": {
+    "type": "string",
+    "default": "【转发消息记录 - 共{count}条】\n━━━━━━━━━━━━━━━━━━━━\n{content}\n━━━━━━━━━━━━━━━━━━━━",
+    "description": "转发内容格式模板",
+    "hint": "可用变量: {count}=消息条数, {content}=消息内容"
+  },
+  "message_template": {
+    "type": "string",
+    "default": "[{sender}] {text}",
+    "description": "每条消息格式模板",
+    "hint": "可用变量: {sender}=发送者昵称, {text}=消息内容"
+  },
+  "image_mode": {
+    "type": "string",
+    "options": ["placeholder", "url", "base64"],
+    "default": "placeholder",
+    "description": "图片处理模式",
+    "hint": "placeholder: [图片]占位; url: 保留URL; base64: 转换为base64编码"
+  },
+  "enable_nested_forward": {
+    "type": "bool",
+    "default": true,
+    "description": "支持嵌套转发",
+    "hint": "开启后会递归解析转发中的转发消息"
+  },
+  "max_nested_depth": {
+    "type": "int",
+    "default": 3,
+    "description": "最大嵌套深度",
+    "hint": "防止无限递归，建议不超过5"
+  },
+  "max_messages": {
+    "type": "int",
+    "default": 50,
+    "description": "最多提取消息条数",
+    "hint": "限制单次转发提取的消息数量"
+  },
+  "inject_position": {
+    "type": "string",
+    "options": ["before_user", "as_system", "merge_with_user"],
+    "default": "before_user",
+    "description": "上下文注入位置",
+    "hint": "before_user: 在用户消息前注入; as_system: 作为system消息; merge_with_user: 合并到用户消息"
+  },
+  "enable_llm_summary": {
+    "type": "bool",
+    "default": false,
+    "description": "启用LLM摘要功能",
+    "hint": "开启后会先用LLM对转发内容进行摘要/总结，再注入上下文（会消耗额外API调用）"
+  },
+  "summary_provider_id": {
+    "type": "string",
+    "default": "",
+    "description": "摘要使用的提供商",
+    "hint": "用于生成摘要的LLM提供商。留空则使用当前正在使用的LLM提供商。建议选择稳定且快速的模型",
+    "_special": "select_provider"
+  },
+  "summary_prompt": {
+    "type": "string",
+    "default": "请阅读以下聊天记录，并生成一份简洁的摘要。要求：\n1. 保留关键信息和重要观点\n2. 标注主要发言者\n3. 如有讨论结论，请明确指出\n4. 摘要控制在300字以内\n\n聊天记录：\n{content}",
+    "description": "摘要提示词模板",
+    "hint": "可用变量: {content}=转发内容, {count}=消息条数"
+  },
+  "summary_inject_template": {
+    "type": "string",
+    "default": "【转发消息摘要 - 原始{count}条消息】\n{summary}",
+    "description": "摘要注入模板",
+    "hint": "可用变量: {summary}=摘要内容, {count}=原始消息条数"
+  },
+  "keep_original_on_summary_fail": {
+    "type": "bool",
+    "default": true,
+    "description": "摘要失败时保留原文",
+    "hint": "当LLM摘要失败时，是否回退到注入原始转发内容"
+  }
+}
