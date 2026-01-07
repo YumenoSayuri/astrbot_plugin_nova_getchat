@@ -36,7 +36,7 @@ except ImportError:
     IS_AIOCQHTTP = False
 
 
-@register("nova-getchat", "Nova", "合并转发上下文注入插件 - 自动解析转发消息并注入AI上下文", "1.1.0")
+@register("nova-getchat", "Nova", "合并转发上下文注入插件 - 自动解析转发消息并注入AI上下文", "1.2.0")
 class NovaGetChatPlugin(Star):
     """Nova合并转发上下文注入插件"""
     
@@ -113,9 +113,15 @@ class NovaGetChatPlugin(Star):
         
         return None
     
-    async def _extract_forward_content(self, event: AstrMessageEvent, forward_id: str, 
-                                        depth: int = 0) -> Tuple[List[Dict[str, Any]], List[str]]:
+    async def _extract_forward_content(self, event: AstrMessageEvent, forward_id: str,
+                                        depth: int = 0, image_mode: str = "placeholder") -> Tuple[List[Dict[str, Any]], List[str]]:
         """提取合并转发消息内容
+        
+        Args:
+            event: 消息事件
+            forward_id: 转发消息ID
+            depth: 当前嵌套深度
+            image_mode: 图片处理模式 (placeholder/url/base64)
         
         返回: (消息列表[{sender, text, images}], 图片URL列表)
         """
@@ -159,10 +165,10 @@ class NovaGetChatPlugin(Star):
                                 node_images.append(img_url)
                                 all_images.append(img_url)
                                 
-                                # 根据模式处理图片
-                                if self.image_mode == "placeholder":
+                                # 根据传入的image_mode处理图片
+                                if image_mode == "placeholder":
                                     text_parts.append("[图片]")
-                                elif self.image_mode == "url":
+                                elif image_mode == "url":
                                     text_parts.append(f"[图片: {img_url}]")
                                 # base64模式在后续处理
                         
@@ -177,7 +183,7 @@ class NovaGetChatPlugin(Star):
                                 if nested_id:
                                     text_parts.append("[嵌套转发开始]")
                                     nested_msgs, nested_imgs = await self._extract_forward_content(
-                                        event, nested_id, depth + 1
+                                        event, nested_id, depth + 1, image_mode
                                     )
                                     for nm in nested_msgs:
                                         text_parts.append(f"  {nm['sender']}: {nm['text']}")
@@ -301,8 +307,14 @@ class NovaGetChatPlugin(Star):
             logger.debug(f"[Nova-GetChat] 清理了 {len(expired_keys)} 条过期缓存")
     
     async def _generate_summary(self, messages: List[Dict[str, Any]],
-                                 event: AstrMessageEvent) -> Optional[str]:
+                                 event: AstrMessageEvent,
+                                 images: List[str] = None) -> Optional[str]:
         """使用LLM生成转发内容摘要
+        
+        Args:
+            messages: 提取的消息列表
+            event: 消息事件
+            images: 转发中的图片URL列表（可选，用于多模态模型）
         
         返回: 摘要文本，失败时返回None
         """
@@ -346,14 +358,39 @@ class NovaGetChatPlugin(Star):
             count=len(messages)
         )
         
+        # 检查是否需要传图片给多模态模型
+        summary_include_images = bool(self.get_cfg("summary_include_images", False))
+        summary_max_images = int(self.get_cfg("summary_max_images", 5))
+        
+        image_urls_to_send = []
+        if summary_include_images and images:
+            # 限制图片数量，直接传原始URL，让AstrBot的provider自己处理转换
+            images_to_process = images[:summary_max_images]
+            logger.info(f"[Nova-GetChat] 摘要时传入 {len(images_to_process)} 张图片给多模态模型")
+            
+            for img_url in images_to_process:
+                # 直接使用原始URL，AstrBot的provider会自行转换为base64
+                if img_url:
+                    image_urls_to_send.append(img_url)
+        
         try:
             logger.info("[Nova-GetChat] 正在调用LLM生成摘要...")
             
-            response = await provider.text_chat(
-                prompt=prompt,
-                session_id=uuid.uuid4().hex,
-                persist=False
-            )
+            # 根据是否有图片选择调用方式
+            if image_urls_to_send:
+                logger.info(f"[Nova-GetChat] 使用多模态模式，包含 {len(image_urls_to_send)} 张图片")
+                response = await provider.text_chat(
+                    prompt=prompt,
+                    session_id=uuid.uuid4().hex,
+                    image_urls=image_urls_to_send,
+                    persist=False
+                )
+            else:
+                response = await provider.text_chat(
+                    prompt=prompt,
+                    session_id=uuid.uuid4().hex,
+                    persist=False
+                )
             
             summary = response.completion_text.strip()
             
@@ -420,30 +457,40 @@ class NovaGetChatPlugin(Star):
         cached = self._get_cached_summary(forward_id)
         if cached and enable_llm_summary:
             # 命中缓存，直接使用
-            logger.info(f"[Nova-GetChat] 使用缓存的摘要，原始{cached['count']}条消息")
+            cached_summary = cached.get('summary', '')
+            cached_count = cached.get('count', 0)
             
-            final_text = summary_inject_template.format(
-                count=cached['count'],
-                summary=cached['summary']
-            )
+            logger.info(f"[Nova-GetChat] 使用缓存的摘要，原始{cached_count}条消息")
+            logger.info(f"[Nova-GetChat] 缓存摘要内容(前100字): {cached_summary[:100] if cached_summary else '(空)'}")
             
-            context_content = [{"type": "text", "text": final_text}]
-            
-            # 存储到会话
-            self.session_forwards[event.unified_msg_origin].append({
-                "timestamp": datetime.datetime.now().isoformat(),
-                "content": context_content,
-                "raw_messages": cached['messages'],
-                "images": cached['images'],
-                "is_summary": True,
-                "from_cache": True
-            })
-            
-            logger.info(f"[Nova-GetChat] (缓存) 转发内容已存储到会话")
-            return
+            if not cached_summary:
+                logger.warning("[Nova-GetChat] 缓存摘要为空！")
+                # 缓存无效，继续正常流程重新生成
+            else:
+                final_text = summary_inject_template.format(
+                    count=cached_count,
+                    summary=cached_summary
+                )
+                
+                logger.info(f"[Nova-GetChat] 格式化后文本(前100字): {final_text[:100]}")
+                
+                context_content = [{"type": "text", "text": final_text}]
+                
+                # 存储到会话
+                self.session_forwards[event.unified_msg_origin].append({
+                    "timestamp": datetime.datetime.now().isoformat(),
+                    "content": context_content,
+                    "raw_messages": cached.get('messages', []),
+                    "images": cached.get('images', []),
+                    "is_summary": True,
+                    "from_cache": True
+                })
+                
+                logger.info(f"[Nova-GetChat] (缓存) 转发内容已存储到会话，content长度: {len(context_content)}")
+                return
         
-        # 提取内容
-        messages, images = await self._extract_forward_content(event, forward_id)
+        # 提取内容，传入image_mode参数
+        messages, images = await self._extract_forward_content(event, forward_id, depth=0, image_mode=image_mode)
         
         if not messages:
             logger.warning("[Nova-GetChat] 未能提取到转发内容")
@@ -456,7 +503,8 @@ class NovaGetChatPlugin(Star):
         is_summary = False
         
         if enable_llm_summary:
-            summary = await self._generate_summary(messages, event)
+            # 传入images参数，支持多模态摘要
+            summary = await self._generate_summary(messages, event, images)
             if summary:
                 # 使用摘要模板
                 final_text = summary_inject_template.format(
@@ -523,53 +571,86 @@ class NovaGetChatPlugin(Star):
         cache_hits = sum(1 for f in forwards if f.get("from_cache", False))
         logger.info(f"[Nova-GetChat] 准备注入 {len(forwards)} 条转发记录 (缓存命中: {cache_hits})")
         
-        # 构建注入内容
-        inject_content = []
-        for fwd in forwards:
-            inject_content.extend(fwd["content"])
+        # 构建注入内容 - 提取所有文本
+        all_text_parts = []
+        all_image_parts = []
         
-        if not inject_content:
+        for fwd in forwards:
+            for item in fwd.get("content", []):
+                if item.get("type") == "text":
+                    text = item.get("text", "")
+                    if text.strip():
+                        all_text_parts.append(text)
+                        logger.debug(f"[Nova-GetChat] 提取文本内容: {text[:100]}...")
+                elif item.get("type") == "image_url":
+                    all_image_parts.append(item)
+        
+        if not all_text_parts and not all_image_parts:
+            logger.warning("[Nova-GetChat] 注入内容为空，跳过注入")
+            self.session_forwards[session_key].clear()
             return
+        
+        # 合并所有文本
+        combined_text = "\n".join(all_text_parts)
+        logger.info(f"[Nova-GetChat] 合并后文本长度: {len(combined_text)} 字符")
         
         # 实时读取inject_position配置
         inject_position = self.get_cfg("inject_position", "before_user")
+        logger.info(f"[Nova-GetChat] 注入位置: {inject_position}")
         
         # 根据配置的位置注入
         if inject_position == "before_user":
-            # 在当前用户消息之前注入
+            # 添加说明前缀，告诉AI这是用户引用的消息内容
+            prefixed_text = f"【以下是用户引用/分享的转发消息内容，请参考后回答用户问题】\n\n{combined_text}"
+            
+            # 构建content - 如果有图片则使用多模态格式，否则使用纯文本
+            if all_image_parts:
+                inject_content = [{"type": "text", "text": prefixed_text}]
+                inject_content.extend(all_image_parts)
+            else:
+                # 使用纯文本格式，兼容性更好
+                inject_content = prefixed_text
+            
             inject_msg = {
                 "role": "user",
                 "content": inject_content
             }
+            
             # 找到最后一个用户消息的位置
             insert_pos = len(req.contexts)
             for i in range(len(req.contexts) - 1, -1, -1):
                 if req.contexts[i].get("role") == "user":
                     insert_pos = i
                     break
+            
             req.contexts.insert(insert_pos, inject_msg)
+            logger.info(f"[Nova-GetChat] 在位置 {insert_pos} 注入转发内容")
             
         elif inject_position == "as_system":
-            # 作为system消息注入
-            text_content = ""
-            for item in inject_content:
-                if item["type"] == "text":
-                    text_content += item["text"]
-            
             inject_msg = {
                 "role": "system",
-                "content": f"用户分享了以下聊天记录，请参考：\n{text_content}"
+                "content": f"用户分享了以下聊天记录，请参考：\n{combined_text}"
             }
             req.contexts.append(inject_msg)
+            logger.info("[Nova-GetChat] 作为system消息注入")
             
         elif inject_position == "merge_with_user":
             # 合并到用户消息中
             if req.prompt:
-                prefix_text = ""
-                for item in inject_content:
-                    if item["type"] == "text":
-                        prefix_text += item["text"] + "\n"
-                req.prompt = prefix_text + "\n" + req.prompt
+                req.prompt = combined_text + "\n\n" + req.prompt
+                logger.info("[Nova-GetChat] 合并到用户prompt中")
+            else:
+                # 如果没有prompt，则添加到contexts最后一个user消息
+                for i in range(len(req.contexts) - 1, -1, -1):
+                    if req.contexts[i].get("role") == "user":
+                        original = req.contexts[i].get("content", "")
+                        if isinstance(original, str):
+                            req.contexts[i]["content"] = combined_text + "\n\n" + original
+                        elif isinstance(original, list):
+                            # 多模态格式
+                            req.contexts[i]["content"].insert(0, {"type": "text", "text": combined_text + "\n\n"})
+                        break
+                logger.info("[Nova-GetChat] 合并到最后一个user消息中")
         
         # 清空已处理的转发记录
         self.session_forwards[session_key].clear()
