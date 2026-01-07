@@ -1,6 +1,6 @@
 name: astrbot_plugin_nova_getchat
-display_name: 合并转发自动注入上下文
-desc: 合并转发上下文注入插件 - 自动解析QQ合并转发消息并注入AI对话上下文
-version: v1.1.0
+display_name: 合并转发静默注入上下文
+desc: 合并转发上下文注入插件 - 自动解析QQ合并转发消息并注入AI对话上下文，支持摘要缓存
+version: v1.2.0
 author: 辉宝
 repo: https://github.com/YumenoSayuri/astrbot_plugin_nova_getchat

@@ -79,5 +79,11 @@
     "default": true,
     "description": "摘要失败时保留原文",
     "hint": "当LLM摘要失败时，是否回退到注入原始转发内容"
+  },
+  "summary_cache_ttl": {
+    "type": "int",
+    "default": 3600,
+    "description": "摘要缓存过期时间(秒)",
+    "hint": "同一个转发消息的摘要会被缓存，在过期时间内再次引用会直接使用缓存，避免重复调用LLM。默认1小时"
   }
 }

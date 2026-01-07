@@ -36,7 +36,7 @@ except ImportError:
     IS_AIOCQHTTP = False
 
 
-@register("nova-getchat", "Nova", "合并转发上下文注入插件 - 自动解析转发消息并注入AI上下文", "1.0.0")
+@register("nova-getchat", "Nova", "合并转发上下文注入插件 - 自动解析转发消息并注入AI上下文", "1.1.0")
 class NovaGetChatPlugin(Star):
     """Nova合并转发上下文注入插件"""
     
@@ -48,31 +48,25 @@ class NovaGetChatPlugin(Star):
         self.session_forwards = defaultdict(list)
         """存储每个会话的转发消息内容"""
         
-        # 基础配置读取
+        # 摘要缓存：以forward_id为key，避免重复分析同一个转发消息
+        self.summary_cache: Dict[str, Dict[str, Any]] = {}
+        """格式: {forward_id: {summary, messages, images, timestamp, count}}"""
+        
+        # 缓存过期时间（秒），默认1小时
+        self.cache_ttl = int(self.get_cfg("summary_cache_ttl", 3600))
+        
+        # 基础配置读取（这些配置不太需要实时更新）
         self.enable_forward_analysis = bool(self.get_cfg("enable_forward_analysis", True))
         self.forward_template = self.get_cfg("forward_template",
             "【转发消息记录 - 共{count}条】\n━━━━━━━━━━━━━━━━━━━━\n{content}\n━━━━━━━━━━━━━━━━━━━━")
         self.message_template = self.get_cfg("message_template", "[{sender}] {text}")
-        self.image_mode = self.get_cfg("image_mode", "placeholder")
         self.enable_nested = bool(self.get_cfg("enable_nested_forward", True))
         self.max_nested_depth = int(self.get_cfg("max_nested_depth", 3))
         self.max_messages = int(self.get_cfg("max_messages", 50))
-        self.inject_position = self.get_cfg("inject_position", "before_user")
-        
-        # LLM摘要配置
-        self.enable_llm_summary = bool(self.get_cfg("enable_llm_summary", False))
-        self.summary_provider_id = self.get_cfg("summary_provider_id", "")
-        self.summary_prompt = self.get_cfg("summary_prompt",
-            "请阅读以下聊天记录，并生成一份简洁的摘要。要求：\n1. 保留关键信息和重要观点\n2. 标注主要发言者\n3. 如有讨论结论，请明确指出\n4. 摘要控制在300字以内\n\n聊天记录：\n{content}")
-        self.summary_inject_template = self.get_cfg("summary_inject_template",
-            "【转发消息摘要 - 原始{count}条消息】\n{summary}")
-        self.keep_original_on_fail = bool(self.get_cfg("keep_original_on_summary_fail", True))
         
         logger.info("[Nova-GetChat] 插件已初始化")
         logger.info(f"[Nova-GetChat] 合并转发分析: {'已启用' if self.enable_forward_analysis else '已禁用'}")
-        logger.info(f"[Nova-GetChat] 图片处理模式: {self.image_mode}")
-        logger.info(f"[Nova-GetChat] 嵌套转发: {'已启用' if self.enable_nested else '已禁用'}")
-        logger.info(f"[Nova-GetChat] LLM摘要: {'已启用' if self.enable_llm_summary else '已禁用'}")
+        logger.info(f"[Nova-GetChat] 摘要缓存TTL: {self.cache_ttl}秒")
     
     def get_cfg(self, key: str, default=None):
         """获取配置项"""
@@ -255,21 +249,82 @@ class NovaGetChatPlugin(Star):
         
         return result
     
+    def _is_cache_valid(self, forward_id: str) -> bool:
+        """检查缓存是否有效"""
+        if forward_id not in self.summary_cache:
+            return False
+        
+        cache_entry = self.summary_cache[forward_id]
+        cache_time = datetime.datetime.fromisoformat(cache_entry["timestamp"])
+        now = datetime.datetime.now()
+        age = (now - cache_time).total_seconds()
+        
+        return age < self.cache_ttl
+    
+    def _get_cached_summary(self, forward_id: str) -> Optional[Dict[str, Any]]:
+        """获取缓存的摘要"""
+        if self._is_cache_valid(forward_id):
+            logger.info(f"[Nova-GetChat] 命中摘要缓存: {forward_id[:20]}...")
+            return self.summary_cache[forward_id]
+        return None
+    
+    def _set_cache(self, forward_id: str, summary: str, messages: List[Dict[str, Any]],
+                   images: List[str]):
+        """设置摘要缓存"""
+        self.summary_cache[forward_id] = {
+            "summary": summary,
+            "messages": messages,
+            "images": images,
+            "count": len(messages),
+            "timestamp": datetime.datetime.now().isoformat()
+        }
+        logger.info(f"[Nova-GetChat] 摘要已缓存: {forward_id[:20]}...")
+        
+        # 清理过期缓存
+        self._cleanup_expired_cache()
+    
+    def _cleanup_expired_cache(self):
+        """清理过期缓存"""
+        now = datetime.datetime.now()
+        expired_keys = []
+        
+        for fid, entry in self.summary_cache.items():
+            cache_time = datetime.datetime.fromisoformat(entry["timestamp"])
+            age = (now - cache_time).total_seconds()
+            if age >= self.cache_ttl:
+                expired_keys.append(fid)
+        
+        for key in expired_keys:
+            del self.summary_cache[key]
+        
+        if expired_keys:
+            logger.debug(f"[Nova-GetChat] 清理了 {len(expired_keys)} 条过期缓存")
+    
     async def _generate_summary(self, messages: List[Dict[str, Any]],
                                  event: AstrMessageEvent) -> Optional[str]:
         """使用LLM生成转发内容摘要
         
         返回: 摘要文本，失败时返回None
         """
-        if not self.enable_llm_summary:
+        # 实时读取配置
+        enable_llm_summary = bool(self.get_cfg("enable_llm_summary", False))
+        if not enable_llm_summary:
             return None
         
-        # 获取Provider
+        # 获取Provider - 实时读取provider_id配置
         provider = None
-        if self.summary_provider_id:
-            provider = self.context.get_provider_by_id(self.summary_provider_id)
+        provider_id = self.get_cfg("summary_provider_id", "")  # 每次调用时重新读取配置
         
+        logger.info(f"[Nova-GetChat] 读取到的provider_id: '{provider_id}'")
+        
+        if provider_id:
+            provider = self.context.get_provider_by_id(provider_id)
+            if not provider:
+                logger.warning(f"[Nova-GetChat] 未找到指定Provider: {provider_id}")
+        
+        # 如果未找到指定provider或未配置，使用当前会话的provider
         if not provider:
+            logger.info(f"[Nova-GetChat] 使用会话默认Provider")
             provider = self.context.get_using_provider(event.unified_msg_origin)
         
         if not provider or not isinstance(provider, Provider):
@@ -281,8 +336,12 @@ class NovaGetChatPlugin(Star):
         for msg in messages:
             raw_content += f"[{msg['sender']}] {msg['text']}\n"
         
+        # 实时读取prompt模板
+        summary_prompt = self.get_cfg("summary_prompt",
+            "请阅读以下聊天记录，并生成一份简洁的摘要。要求：\n1. 保留关键信息和重要观点\n2. 标注主要发言者\n3. 如有讨论结论，请明确指出\n4. 摘要控制在300字以内\n\n聊天记录：\n{content}")
+        
         # 构建prompt
-        prompt = self.summary_prompt.format(
+        prompt = summary_prompt.format(
             content=raw_content,
             count=len(messages)
         )
@@ -350,6 +409,39 @@ class NovaGetChatPlugin(Star):
         
         logger.info(f"[Nova-GetChat] 开始处理转发消息 ID: {forward_id}")
         
+        # 实时读取配置
+        enable_llm_summary = bool(self.get_cfg("enable_llm_summary", False))
+        image_mode = self.get_cfg("image_mode", "placeholder")
+        keep_original_on_fail = bool(self.get_cfg("keep_original_on_summary_fail", True))
+        summary_inject_template = self.get_cfg("summary_inject_template",
+            "【转发消息摘要 - 原始{count}条消息】\n{summary}")
+        
+        # 检查缓存
+        cached = self._get_cached_summary(forward_id)
+        if cached and enable_llm_summary:
+            # 命中缓存，直接使用
+            logger.info(f"[Nova-GetChat] 使用缓存的摘要，原始{cached['count']}条消息")
+            
+            final_text = summary_inject_template.format(
+                count=cached['count'],
+                summary=cached['summary']
+            )
+            
+            context_content = [{"type": "text", "text": final_text}]
+            
+            # 存储到会话
+            self.session_forwards[event.unified_msg_origin].append({
+                "timestamp": datetime.datetime.now().isoformat(),
+                "content": context_content,
+                "raw_messages": cached['messages'],
+                "images": cached['images'],
+                "is_summary": True,
+                "from_cache": True
+            })
+            
+            logger.info(f"[Nova-GetChat] (缓存) 转发内容已存储到会话")
+            return
+        
         # 提取内容
         messages, images = await self._extract_forward_content(event, forward_id)
         
@@ -363,17 +455,21 @@ class NovaGetChatPlugin(Star):
         final_text = ""
         is_summary = False
         
-        if self.enable_llm_summary:
+        if enable_llm_summary:
             summary = await self._generate_summary(messages, event)
             if summary:
                 # 使用摘要模板
-                final_text = self.summary_inject_template.format(
+                final_text = summary_inject_template.format(
                     count=len(messages),
                     summary=summary
                 )
                 is_summary = True
                 logger.info("[Nova-GetChat] 使用LLM摘要作为注入内容")
-            elif self.keep_original_on_fail:
+                
+                # 缓存摘要结果
+                self._set_cache(forward_id, summary, messages, images)
+                
+            elif keep_original_on_fail:
                 # 摘要失败，回退到原始格式
                 final_text = self._format_forward_content(messages)
                 logger.warning("[Nova-GetChat] 摘要失败，回退到原始转发内容")
@@ -390,7 +486,7 @@ class NovaGetChatPlugin(Star):
         context_content.append({"type": "text", "text": final_text})
         
         # 处理图片 (base64模式，仅在非摘要模式或摘要失败时添加图片)
-        if self.image_mode == "base64" and images and not is_summary:
+        if image_mode == "base64" and images and not is_summary:
             for img_url in images[:10]:  # 限制图片数量
                 b64_data = await self._encode_image_base64(img_url)
                 if b64_data:
@@ -405,7 +501,8 @@ class NovaGetChatPlugin(Star):
             "content": context_content,
             "raw_messages": messages,
             "images": images,
-            "is_summary": is_summary
+            "is_summary": is_summary,
+            "from_cache": False
         })
         
         logger.info(f"[Nova-GetChat] 转发内容已存储到会话 {event.unified_msg_origin}")
@@ -422,7 +519,9 @@ class NovaGetChatPlugin(Star):
         if not forwards:
             return
         
-        logger.info(f"[Nova-GetChat] 准备注入 {len(forwards)} 条转发记录到上下文")
+        # 统计缓存命中情况
+        cache_hits = sum(1 for f in forwards if f.get("from_cache", False))
+        logger.info(f"[Nova-GetChat] 准备注入 {len(forwards)} 条转发记录 (缓存命中: {cache_hits})")
         
         # 构建注入内容
         inject_content = []
@@ -432,8 +531,11 @@ class NovaGetChatPlugin(Star):
         if not inject_content:
             return
         
+        # 实时读取inject_position配置
+        inject_position = self.get_cfg("inject_position", "before_user")
+        
         # 根据配置的位置注入
-        if self.inject_position == "before_user":
+        if inject_position == "before_user":
             # 在当前用户消息之前注入
             inject_msg = {
                 "role": "user",
@@ -447,7 +549,7 @@ class NovaGetChatPlugin(Star):
                     break
             req.contexts.insert(insert_pos, inject_msg)
             
-        elif self.inject_position == "as_system":
+        elif inject_position == "as_system":
             # 作为system消息注入
             text_content = ""
             for item in inject_content:
@@ -460,7 +562,7 @@ class NovaGetChatPlugin(Star):
             }
             req.contexts.append(inject_msg)
             
-        elif self.inject_position == "merge_with_user":
+        elif inject_position == "merge_with_user":
             # 合并到用户消息中
             if req.prompt:
                 prefix_text = ""
